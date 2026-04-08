@@ -1,0 +1,169 @@
+# Build linux/amd64 controller image and publish Helm chart to Docker Hub (image + OCI chart).
+# After push, runs Trivy on the published image (same idea as vulnerability-scans.yaml, but your registry).
+#
+# Required repo secrets (Settings > Secrets and variables > Actions):
+#   DOCKERHUB_USERNAME
+#   DOCKERHUB_TOKEN   (access token with read/write; not account password if 2FA is on)
+#
+# Outputs:
+#   Image:    docker.io/<DOCKERHUB_USERNAME>/controller:<TAG>   (TAG from repo root file TAG)
+#   Chart:    helm push ... oci://registry-1.docker.io/<DOCKERHUB_USERNAME>
+#
+# NSP cn-nsp-ingress overlay: install base chart with release name "nginx-ingress" first.
+
+name: Publish controller and Helm chart to Docker Hub
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-push-controller:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.imagetag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image tag from repo
+        id: imagetag
+        run: |
+          TAG=$(tr -d ' \n' < TAG)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=${TAG}" >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: GOLANG_VERSION
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build controller binary
+        env:
+          ARCH: amd64
+        run: make build ARCH=amd64
+
+      - name: Build and push controller image (linux/amd64)
+        env:
+          ARCH: amd64
+          REGISTRY: docker.io/${{ secrets.DOCKERHUB_USERNAME }}
+          COMMIT_SHA: git-${{ github.sha }}
+          BUILD_ID: ${{ github.run_id }}
+        run: |
+          make image ARCH=amd64 REGISTRY="$REGISTRY" TAG="$IMAGE_TAG"
+          docker push "${REGISTRY}/controller:${IMAGE_TAG}"
+
+  scan-controller-trivy:
+    name: Trivy scan (published controller image)
+    needs: build-push-controller
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Log in to Docker Hub (for private images)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/controller:${{ needs.build-push-controller.outputs.image_tag }}
+          format: sarif
+          output: trivy-controller.sarif
+          exit-code: "0"
+          vuln-type: os,library
+          severity: CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN
+
+      - name: Upload SARIF to GitHub code scanning
+        uses: github/codeql-action/upload-sarif@b1bff81932f5cdfc8695c7752dcee935dcd061c8 # v4.33.0
+        continue-on-error: true
+        with:
+          sarif_file: trivy-controller.sarif
+          category: trivy-dockerhub-controller
+
+      - name: Summary
+        run: |
+          COUNT=$(jq '(.runs[0].results // []) | length' trivy-controller.sarif)
+          echo "## Trivy findings" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: \`docker.io/${{ secrets.DOCKERHUB_USERNAME }}/controller:${{ needs.build-push-controller.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Result count: **${COUNT}**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SARIF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-controller-sarif
+          path: trivy-controller.sarif
+
+  package-push-helm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image tag from repo
+        run: |
+          echo "IMAGE_TAG=$(tr -d ' \n' < TAG)" >> "$GITHUB_ENV"
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Point chart default image at Docker Hub controller
+        env:
+          REPO: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/controller
+        run: |
+          yq -i ".controller.image.repository = \"${REPO}\"" charts/ingress-nginx/values.yaml
+          yq -i ".controller.image.tag = \"${IMAGE_TAG}\"" charts/ingress-nginx/values.yaml
+          yq -i '.controller.image.digest = ""' charts/ingress-nginx/values.yaml
+          yq -i '.controller.image.digestChroot = ""' charts/ingress-nginx/values.yaml
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+
+      - name: Package chart
+        run: |
+          mkdir -p /tmp/chart-out
+          helm package charts/ingress-nginx --destination /tmp/chart-out
+
+      - name: Log in to Docker Hub (Helm OCI)
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | helm registry login registry-1.docker.io \
+            --username "${{ secrets.DOCKERHUB_USERNAME }}" \
+            --password-stdin
+
+      - name: Push chart to Docker Hub (OCI)
+        run: |
+          shopt -s nullglob
+          for f in /tmp/chart-out/ingress-nginx-*.tgz; do
+            helm push "$f" "oci://registry-1.docker.io/${{ secrets.DOCKERHUB_USERNAME }}"
+          done
+
+      - name: Upload chart tarball (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart-tgz
+          path: /tmp/chart-out/ingress-nginx-*.tgz
