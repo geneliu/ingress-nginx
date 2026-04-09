@@ -59,10 +59,31 @@ ifneq ($(PLATFORM),)
 endif
 
 REGISTRY ?= us-central1-docker.pkg.dev/k8s-staging-images/ingress-nginx
+# REGISTRY= on the command line or empty env overrides ?= and yields invalid refs like "/controller:tag".
+ifeq ($(strip $(REGISTRY)),)
+REGISTRY := us-central1-docker.pkg.dev/k8s-staging-images/ingress-nginx
+endif
 
 BASE_IMAGE ?= $(shell cat NGINX_BASE)
+# Final stage of rootfs/Dockerfile-chroot only (Alpine runtime). Override if registry-1.docker.io TLS fails behind inspection.
+RUNTIME_BASE_IMAGE ?= alpine:3.23.3
 
 GOARCH=$(ARCH)
+
+# Container engine for image targets (local: Podman on Mac, e.g. make image DOCKER=podman).
+DOCKER ?= docker
+# Engine for `make build` (build/run-in-docker.sh); use podman on Mac when not using Docker Desktop.
+RUNTIME ?= docker
+
+# Native platform for Dockerfile AS chroot-devices (mknod). When cross-building (e.g. PLATFORM=linux/amd64 on arm64), this must match
+# the Podman/Docker host (linux/$(shell go env GOARCH)), not ARCH. Override if auto-detection is wrong.
+CHROOT_DEV_PLATFORM ?= linux/$(shell go env GOARCH 2>/dev/null || echo amd64)
+
+# Rootless Podman (default on macOS) denies mknod unless seccomp/capabilities allow it; QEMU cross-builds need this too.
+# Disable: CHROOT_IMAGE_BUILD_FLAGS=   Rootful VM still fails: see build/developer-tricks.md (Podman rootful).
+ifeq ($(DOCKER),podman)
+CHROOT_IMAGE_BUILD_FLAGS ?= --security-opt seccomp=unconfined --cap-add CAP_MKNOD
+endif
 
 help:  ## Display this help
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
@@ -70,7 +91,7 @@ help:  ## Display this help
 .PHONY: image
 image: clean-image ## Build image for a particular arch.
 	echo "Building docker image ($(ARCH))..."
-	docker build \
+	$(DOCKER) build \
 		${PLATFORM_FLAG} ${PLATFORM} \
 		--no-cache \
 		--build-arg BASE_IMAGE="$(BASE_IMAGE)" \
@@ -87,9 +108,13 @@ gosec:
 .PHONY: image-chroot
 image-chroot: clean-chroot-image ## Build image for a particular arch.
 	echo "Building docker image ($(ARCH))..."
-	docker build \
+	$(DOCKER) build \
+		${PLATFORM_FLAG} ${PLATFORM} \
+		$(CHROOT_IMAGE_BUILD_FLAGS) \
 		--no-cache \
 		--build-arg BASE_IMAGE="$(BASE_IMAGE)" \
+		--build-arg CHROOT_DEV_PLATFORM="$(CHROOT_DEV_PLATFORM)" \
+		--build-arg RUNTIME_BASE_IMAGE="$(RUNTIME_BASE_IMAGE)" \
 		--build-arg VERSION="$(TAG)" \
 		--build-arg TARGETARCH="$(ARCH)" \
 		--build-arg COMMIT_SHA="$(COMMIT_SHA)" \
@@ -99,18 +124,18 @@ image-chroot: clean-chroot-image ## Build image for a particular arch.
 .PHONY: clean-image
 clean-image: ## Removes local image
 	echo "removing old image $(REGISTRY)/controller:$(TAG)"
-	@docker rmi -f $(REGISTRY)/controller:$(TAG) || true
+	@$(DOCKER) rmi -f $(REGISTRY)/controller:$(TAG) || true
 
 
 .PHONY: clean-chroot-image
 clean-chroot-image: ## Removes local image
 	echo "removing old image $(REGISTRY)/controller-chroot:$(TAG)"
-	@docker rmi -f $(REGISTRY)/controller-chroot:$(TAG) || true
+	@$(DOCKER) rmi -f $(REGISTRY)/controller-chroot:$(TAG) || true
 
 
 .PHONY: build
 build:  ## Build ingress controller, debug tool and pre-stop hook.
-	E2E_IMAGE=golang:$(GO_VERSION)-alpine3.23 USE_SHELL=/bin/sh build/run-in-docker.sh \
+	RUNTIME=$(RUNTIME) E2E_IMAGE=golang:$(GO_VERSION)-alpine3.23 USE_SHELL=/bin/sh build/run-in-docker.sh \
 		MAC_OS=$(MAC_OS) \
 		PKG=$(PKG) \
 		ARCH=$(ARCH) \
@@ -245,6 +270,21 @@ builder:
 show-version:
 	echo -n $(TAG)
 
+# Bugfix / CVE patches only: controller image (amd64) + Helm chart OCI. Not multi-arch release or chroot image.
+.PHONY: ci-publish
+ci-publish: ## Patch publish: controller + chart (hack/ci/jenkins-controller-publish.sh; REGISTRY, REGISTRY_USER, REGISTRY_PASSWORD; optional HTTP*_PROXY)
+	@test -n "$(REGISTRY)" || (echo "REGISTRY required, e.g. docker.io/myuser"; exit 1)
+	@test -n "$(REGISTRY_USER)" || (echo "REGISTRY_USER required"; exit 1)
+	@test -n "$(REGISTRY_PASSWORD)" || (echo "REGISTRY_PASSWORD required"; exit 1)
+	bash hack/ci/jenkins-controller-publish.sh
+
+# Local (e.g. Mac M4 + Podman): image + Helm tgz only, no registry. Faster: ARCH=arm64. Linux/amd64 cluster: ARCH=amd64 PLATFORM=linux/amd64
+# Inherits the caller environment (HTTP_PROXY, HTTPS_PROXY, NO_PROXY, GOPROXY, ...). Unset vars are not passed into the Go container except via run-in-docker.sh rules (only -e for vars that are set).
+.PHONY: local-patch-artifacts
+local-patch-artifacts: ## Podman, SKIP_PUSH=1; dist/patch-artifacts/; proxy/GOPROXY from env if set (see build/README.md)
+	SKIP_PUSH=1 RUNTIME=podman DOCKER=podman REGISTRY="$${REGISTRY:-localhost/ingress}" \
+		bash hack/ci/jenkins-controller-publish.sh
+
 BUILDER ?= ingress-nginx
 PLATFORMS ?= amd64 arm arm64
 BUILDX_PLATFORMS ?= linux/amd64,linux/arm,linux/arm64
@@ -277,6 +317,8 @@ release: builder clean
 		--progress plain \
 		--platform $(BUILDX_PLATFORMS)  \
 		--build-arg BASE_IMAGE="$(BASE_IMAGE)" \
+		--build-arg CHROOT_DEV_PLATFORM="$(CHROOT_DEV_PLATFORM)" \
+		--build-arg RUNTIME_BASE_IMAGE="$(RUNTIME_BASE_IMAGE)" \
 		--build-arg VERSION="$(TAG)" \
 		--build-arg COMMIT_SHA="$(COMMIT_SHA)" \
 		--build-arg BUILD_ID="$(BUILD_ID)" \

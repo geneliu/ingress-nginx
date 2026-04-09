@@ -86,7 +86,15 @@ if [[ "$DOCKER_IN_DOCKER_ENABLED" == "true" ]]; then
 else
   echo "Reached DIND check ELSE block, inside run-in-docker.sh"
 
-  args="${PLATFORM_FLAG} ${PLATFORM} --tty --rm ${DOCKER_OPTS} -e DEBUG=${DEBUG} -e GOCACHE="/go/src/${PKG}/.cache" -e GOMODCACHE="/go/src/${PKG}/.modcache" -e DOCKER_IN_DOCKER_ENABLED="true" -v "${HOME}/.kube:${HOME}/.kube" -v "${KUBE_ROOT}:/go/src/${PKG}" -v "${KUBE_ROOT}/bin/${ARCH}:/go/bin/linux_${ARCH}" -v "${INGRESS_VOLUME}:/etc/ingress-controller/" -w "/go/src/${PKG}""
+  # Forward proxy and Go module settings into the build container (corporate networks).
+  proxy_env_flags=""
+  for var in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy ALL_PROXY all_proxy GOPROXY GOPRIVATE GOSUMDB; do
+    if [[ -n "${!var:-}" ]]; then
+      proxy_env_flags+=" -e ${var}=${!var}"
+    fi
+  done
+
+  args="${PLATFORM_FLAG} ${PLATFORM} --tty --rm ${DOCKER_OPTS} -e DEBUG=${DEBUG} -e GOCACHE="/go/src/${PKG}/.cache" -e GOMODCACHE="/go/src/${PKG}/.modcache" -e DOCKER_IN_DOCKER_ENABLED="true"${proxy_env_flags} -v "${HOME}/.kube:${HOME}/.kube" -v "${KUBE_ROOT}:/go/src/${PKG}" -v "${KUBE_ROOT}/bin/${ARCH}:/go/bin/linux_${ARCH}" -v "${INGRESS_VOLUME}:/etc/ingress-controller/" -w "/go/src/${PKG}""
 
   if [[ "$RUNTIME" == "docker" ]]; then
     args="$args -v /var/run/docker.sock:/var/run/docker.sock"

@@ -1,0 +1,40 @@
+// Optional Gradle entry for orgs that standardize on Gradle-wrapped CI.
+// Scope: bugfix/CVE patch publish only (controller image amd64 + Helm chart OCI). Not Java; delegates to Jenkinsfile script.
+//
+// Usage (from repository root):
+//   export REGISTRY=registry.example.com/myorg
+//   export REGISTRY_USER=...
+//   export REGISTRY_PASSWORD=...
+//   gradle -p ci -b jenkins-delegate.gradle publishController
+//
+// Optional: CI_IMAGE_TAG, SKIP_HELM=1, SKIP_TRIVY=1 (export before gradle)
+// Proxy: export HTTP_PROXY / HTTPS_PROXY / NO_PROXY (and lowercase forms) for internal networks.
+
+def repoRoot = file('..')
+
+tasks.register('publishController', Exec) {
+  group = 'ci'
+  description = 'Patch publish: controller image + Helm chart (hack/ci/jenkins-controller-publish.sh)'
+  workingDir = repoRoot
+  commandLine 'bash', 'hack/ci/jenkins-controller-publish.sh'
+  environment 'REGISTRY', System.getenv('REGISTRY') ?: ''
+  environment 'REGISTRY_USER', System.getenv('REGISTRY_USER') ?: ''
+  environment 'REGISTRY_PASSWORD', System.getenv('REGISTRY_PASSWORD') ?: ''
+  environment 'CI_IMAGE_TAG', System.getenv('CI_IMAGE_TAG') ?: ''
+  environment 'SKIP_HELM', System.getenv('SKIP_HELM') ?: ''
+  environment 'SKIP_TRIVY', System.getenv('SKIP_TRIVY') ?: ''
+  environment 'TAG_NAME', System.getenv('TAG_NAME') ?: ''
+  environment 'BUILD_NUMBER', System.getenv('BUILD_NUMBER') ?: ''
+  environment 'DOCKER', System.getenv('DOCKER') ?: ''
+  environment 'RUNTIME', System.getenv('RUNTIME') ?: ''
+  environment 'SKIP_PUSH', System.getenv('SKIP_PUSH') ?: ''
+  [
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
+    'ALL_PROXY', 'all_proxy', 'GOPROXY', 'GOPRIVATE', 'GOSUMDB'
+  ].each { String key ->
+    def v = System.getenv(key)
+    if (v != null) {
+      environment key, v
+    }
+  }
+}

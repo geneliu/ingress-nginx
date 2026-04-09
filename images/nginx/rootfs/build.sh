@@ -181,6 +181,17 @@ apk add \
   grpc-dev \
   protobuf-dev
 
+# Corporate TLS inspection: merge optional PEMs after ca-certificates is installed/upgraded above.
+# See /build-certs/README.md. Export chain from https://github.com (or use org root CA), not only docker.com.
+if ls /build-certs/*.pem >/dev/null 2>&1; then
+  echo ">>> Adding TLS certs from /build-certs/*.pem into the system bundle"
+  awk 'BEGIN{n=0; o=""} /BEGIN CERTIFICATE/{if(o!="")close(o); n++; o=sprintf("/usr/local/share/ca-certificates/build-corp-%d.crt",n)} n{print > o}' /build-certs/*.pem
+  update-ca-certificates
+else
+  echo ">>> WARNING: No /build-certs/*.pem in this image build context."
+  echo ">>> Copy PEM files into images/nginx/rootfs/build-certs/ on the host, then rebuild (see build-certs/README.md)."
+fi
+
 # apk add -X http://dl-cdn.alpinelinux.org/alpine/edge/testing opentelemetry-cpp-dev
 
 mkdir -p /etc/nginx

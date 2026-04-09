@@ -15,6 +15,7 @@ FROM alpine:3.23.3@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f
 
 COPY . /
 
+# Optional PEM files in build-certs/: merged inside build.sh after apk add (see build-certs/README.md).
 RUN apk update \
   && apk upgrade \
   && apk add -U bash --no-cache \

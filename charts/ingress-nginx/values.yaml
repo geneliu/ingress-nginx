@@ -31,8 +31,8 @@ controller:
     ## use *either* current default registry/image or repository format or installing chart by providing the values.yaml will fail
     ## repository:
     tag: "v1.15.2"
-    digest: sha256:594ceea76b01c592858f803f9ff4d2cb40542cae2060410b2c95f75907d659e1
-    digestChroot: sha256:af31d00c9d82c612896b380a9003bd36843b7647b98e4588251c66325317bc72
+    digest: ""
+    digestChroot: ""
     pullPolicy: IfNotPresent
     runAsNonRoot: true
     # -- This value must not be changed using the official image.
@@ -45,6 +45,7 @@ controller:
     seccompProfile:
       type: RuntimeDefault
     readOnlyRootFilesystem: false
+    repository: localhost/ingress/controller
   # -- Configures the controller container name
   containerName: controller
   # -- Configures the ports that the nginx-controller listens on

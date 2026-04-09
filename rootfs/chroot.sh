@@ -46,6 +46,11 @@ mkdir -p  /chroot/lib /chroot/proc /chroot/usr /chroot/bin /chroot/dev /chroot/r
 cp /etc/passwd /etc/group /etc/hosts /chroot/etc/
 cp -a /usr/* /chroot/usr/
 cp -a /etc/nginx/* /chroot/etc/nginx/
-cp -a /etc/ingress-controller/* /chroot/etc/ingress-controller/
+# Base nginx image may ship an empty /etc/ingress-controller; unexpanded globs break cp.
+shopt -s nullglob
+for f in /etc/ingress-controller/*; do
+  cp -a "$f" /chroot/etc/ingress-controller/
+done
+shopt -u nullglob
 cp /lib/ld-musl-* /chroot/lib/
 cp /usr/lib/libcrypto* /usr/lib/libssl* /usr/lib/libz* /chroot/usr/lib/
