@@ -1,14 +1,21 @@
-# Build linux/amd64 controller image and publish Helm chart to Docker Hub (image + OCI chart).
-# After push, runs Trivy on the published image (same idea as vulnerability-scans.yaml, but your registry).
+# Build linux/amd64 images and publish Helm chart to Docker Hub (images + OCI chart).
+# Pushes: nginx base (images/nginx), controller, controller-chroot, kube-webhook-certgen, then Helm chart.
+# The workflow .github/workflows/build-images.yml only builds (no push) for CI verification; this workflow publishes.
 #
 # Required repo secrets (Settings > Secrets and variables > Actions):
 #   DOCKERHUB_USERNAME
 #   DOCKERHUB_TOKEN   (access token with read/write; not account password if 2FA is on)
 #
 # Outputs:
-#   Image:    docker.io/<DOCKERHUB_USERNAME>/controller:<TAG>
+#   Images:   docker.io/<DOCKERHUB_USERNAME>/nginx:<images/nginx/TAG>
+#             docker.io/<DOCKERHUB_USERNAME>/controller:<TAG>
+#             docker.io/<DOCKERHUB_USERNAME>/controller-chroot:<TAG>
+#             docker.io/<DOCKERHUB_USERNAME>/kube-webhook-certgen:<images/kube-webhook-certgen/TAG>
 #   TAG:      On push of a git tag matching v*, uses that tag name. Otherwise uses repo root file TAG.
 #   Chart:    helm push ... oci://registry-1.docker.io/<DOCKERHUB_USERNAME>
+#
+# Chroot mode: chart default is controller.image.chroot=false. If you set chroot=true, set
+# controller.image.repository to docker.io/<USER>/controller-chroot (same tag as controller).
 #
 # NSP cn-nsp-ingress overlay: install base chart with release name "nginx-ingress" first.
 
@@ -27,9 +34,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  DOCKER_BUILDKIT: 1
+
 jobs:
-  build-push-controller:
+  build-push-images:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     outputs:
       image_tag: ${{ steps.imagetag.outputs.tag }}
     steps:
@@ -61,6 +72,23 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Read auxiliary image tags
+        run: |
+          echo "NGINX_TAG=$(tr -d ' \n' < images/nginx/TAG)" >> "$GITHUB_ENV"
+          echo "CERTGEN_TAG=$(tr -d ' \n' < images/kube-webhook-certgen/TAG)" >> "$GITHUB_ENV"
+          echo "REGISTRY_DH=docker.io/${{ secrets.DOCKERHUB_USERNAME }}" >> "$GITHUB_ENV"
+
+      - name: Build and push nginx base (controller BASE_IMAGE)
+        run: |
+          set -euxo pipefail
+          docker build \
+            -t "${REGISTRY_DH}/nginx:${NGINX_TAG}" \
+            -f images/nginx/rootfs/Dockerfile \
+            images/nginx/rootfs
+          docker push "${REGISTRY_DH}/nginx:${NGINX_TAG}"
+          echo "${REGISTRY_DH}/nginx:${NGINX_TAG}" > NGINX_BASE
+          echo "NGINX_BASE=$(cat NGINX_BASE)"
+
       - name: Build controller binary
         env:
           ARCH: amd64
@@ -69,16 +97,37 @@ jobs:
       - name: Build and push controller image (linux/amd64)
         env:
           ARCH: amd64
-          REGISTRY: docker.io/${{ secrets.DOCKERHUB_USERNAME }}
           COMMIT_SHA: git-${{ github.sha }}
           BUILD_ID: ${{ github.run_id }}
         run: |
-          make image ARCH=amd64 REGISTRY="$REGISTRY" TAG="$IMAGE_TAG"
-          docker push "${REGISTRY}/controller:${IMAGE_TAG}"
+          set -euxo pipefail
+          make image ARCH=amd64 REGISTRY="$REGISTRY_DH" TAG="$IMAGE_TAG"
+          docker push "${REGISTRY_DH}/controller:${IMAGE_TAG}"
+
+      - name: Build and push controller-chroot image (linux/amd64)
+        env:
+          ARCH: amd64
+          COMMIT_SHA: git-${{ github.sha }}
+          BUILD_ID: ${{ github.run_id }}
+        run: |
+          set -euxo pipefail
+          make image-chroot ARCH=amd64 REGISTRY="$REGISTRY_DH" TAG="$IMAGE_TAG"
+          docker push "${REGISTRY_DH}/controller-chroot:${IMAGE_TAG}"
+
+      - name: Build and push kube-webhook-certgen (linux/amd64)
+        run: |
+          set -euxo pipefail
+          GOLANG_VERSION=$(tr -d ' \n' < GOLANG_VERSION)
+          docker build \
+            --build-arg "GOLANG_VERSION=${GOLANG_VERSION}" \
+            -t "${REGISTRY_DH}/kube-webhook-certgen:${CERTGEN_TAG}" \
+            -f images/kube-webhook-certgen/rootfs/Dockerfile \
+            images/kube-webhook-certgen/rootfs
+          docker push "${REGISTRY_DH}/kube-webhook-certgen:${CERTGEN_TAG}"
 
   scan-controller-trivy:
     name: Trivy scan (published controller image)
-    needs: build-push-controller
+    needs: build-push-images
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -93,7 +142,7 @@ jobs:
       - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
-          image-ref: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/controller:${{ needs.build-push-controller.outputs.image_tag }}
+          image-ref: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/controller:${{ needs.build-push-images.outputs.image_tag }}
           format: sarif
           output: trivy-controller.sarif
           exit-code: "0"
@@ -111,7 +160,7 @@ jobs:
         run: |
           COUNT=$(jq '(.runs[0].results // []) | length' trivy-controller.sarif)
           echo "## Trivy findings" >> "$GITHUB_STEP_SUMMARY"
-          echo "Image: \`docker.io/${{ secrets.DOCKERHUB_USERNAME }}/controller:${{ needs.build-push-controller.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: \`docker.io/${{ secrets.DOCKERHUB_USERNAME }}/controller:${{ needs.build-push-images.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Result count: **${COUNT}**" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload SARIF artifact
@@ -134,6 +183,9 @@ jobs:
             echo "IMAGE_TAG=$(tr -d ' \n' < TAG)" >> "$GITHUB_ENV"
           fi
 
+      - name: Read certgen chart tag
+        run: echo "CERTGEN_TAG=$(tr -d ' \n' < images/kube-webhook-certgen/TAG)" >> "$GITHUB_ENV"
+
       - name: Install yq
         run: |
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.45.1/yq_linux_amd64
@@ -142,11 +194,15 @@ jobs:
       - name: Point chart default image at Docker Hub controller
         env:
           REPO: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/controller
+          CERTGEN_REPO: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/kube-webhook-certgen
         run: |
           yq -i ".controller.image.repository = \"${REPO}\"" charts/ingress-nginx/values.yaml
           yq -i ".controller.image.tag = \"${IMAGE_TAG}\"" charts/ingress-nginx/values.yaml
           yq -i '.controller.image.digest = ""' charts/ingress-nginx/values.yaml
           yq -i '.controller.image.digestChroot = ""' charts/ingress-nginx/values.yaml
+          yq -i ".controller.admissionWebhooks.patch.image.repository = \"${CERTGEN_REPO}\"" charts/ingress-nginx/values.yaml
+          yq -i ".controller.admissionWebhooks.patch.image.tag = \"${CERTGEN_TAG}\"" charts/ingress-nginx/values.yaml
+          yq -i '.controller.admissionWebhooks.patch.image.digest = ""' charts/ingress-nginx/values.yaml
 
       - name: Install Helm
         uses: azure/setup-helm@v4

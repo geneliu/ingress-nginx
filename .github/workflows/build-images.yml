@@ -1,5 +1,6 @@
 # Build ingress-nginx container images locally in CI (no registry push).
 # Mirrors the common local sequence: nginx base -> NGINX_BASE -> make build -> controller + chroot -> certgen.
+# To publish the same set to Docker Hub + Helm OCI, use workflow "Publish controller and Helm chart to Docker Hub".
 #
 # Triggers: manual (workflow_dispatch), pushes/PRs that touch build-related paths.
 # The nginx base compile is slow; use workflow_dispatch when you only need other images.
