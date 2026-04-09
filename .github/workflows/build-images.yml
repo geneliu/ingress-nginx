@@ -1,0 +1,124 @@
+# Build ingress-nginx container images locally in CI (no registry push).
+# Mirrors the common local sequence: nginx base -> NGINX_BASE -> make build -> controller + chroot -> certgen.
+#
+# Triggers: manual (workflow_dispatch), pushes/PRs that touch build-related paths.
+# The nginx base compile is slow; use workflow_dispatch when you only need other images.
+
+name: Build container images
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - '**'
+    paths:
+      - '.github/workflows/build-images.yml'
+      - 'images/nginx/**'
+      - 'images/kube-webhook-certgen/**'
+      - 'rootfs/**'
+      - 'Makefile'
+      - 'NGINX_BASE'
+      - 'TAG'
+      - 'GOLANG_VERSION'
+      - 'GO_VERSION'
+      - 'build/build.sh'
+      - 'build/run-in-docker.sh'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'pkg/**'
+      - 'go.mod'
+      - 'go.sum'
+  pull_request:
+    paths:
+      - '.github/workflows/build-images.yml'
+      - 'images/nginx/**'
+      - 'images/kube-webhook-certgen/**'
+      - 'rootfs/**'
+      - 'Makefile'
+      - 'NGINX_BASE'
+      - 'TAG'
+      - 'GOLANG_VERSION'
+      - 'GO_VERSION'
+      - 'build/build.sh'
+      - 'build/run-in-docker.sh'
+      - 'cmd/**'
+      - 'internal/**'
+      - 'pkg/**'
+      - 'go.mod'
+      - 'go.sum'
+
+concurrency:
+  group: build-images-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  DOCKER_BUILDKIT: 1
+  REGISTRY_CI: ingress-nginx/ci
+
+jobs:
+  images:
+    name: Build all images (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Read image tags from repo
+        run: |
+          echo "NGINX_TAG=$(cat images/nginx/TAG)" >> "$GITHUB_ENV"
+          echo "CONTROLLER_TAG=$(cat TAG)" >> "$GITHUB_ENV"
+          echo "CERTGEN_TAG=$(cat images/kube-webhook-certgen/TAG)" >> "$GITHUB_ENV"
+          echo "GOLANG_VERSION=$(cat GOLANG_VERSION)" >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: ${{ env.GOLANG_VERSION }}
+          check-latest: true
+
+      - name: Build nginx base (images/nginx)
+        run: |
+          set -euxo pipefail
+          NGINX_IMAGE="${REGISTRY_CI}/nginx:${NGINX_TAG}"
+          docker build \
+            -t "${NGINX_IMAGE}" \
+            -f images/nginx/rootfs/Dockerfile \
+            images/nginx/rootfs
+          echo "${NGINX_IMAGE}" > NGINX_BASE
+          echo "NGINX_BASE is now $(cat NGINX_BASE)"
+
+      - name: Build controller binaries (make build)
+        run: |
+          set -euxo pipefail
+          make build ARCH=amd64
+
+      - name: Build controller image (make image)
+        run: |
+          set -euxo pipefail
+          REGISTRY="${REGISTRY_CI}" make image ARCH=amd64
+
+      - name: Build controller-chroot image (make image-chroot)
+        run: |
+          set -euxo pipefail
+          REGISTRY="${REGISTRY_CI}" make image-chroot ARCH=amd64
+
+      - name: Build kube-webhook-certgen image
+        run: |
+          set -euxo pipefail
+          docker build \
+            --build-arg "GOLANG_VERSION=${GOLANG_VERSION}" \
+            -t "${REGISTRY_CI}/kube-webhook-certgen:${CERTGEN_TAG}" \
+            -f images/kube-webhook-certgen/rootfs/Dockerfile \
+            images/kube-webhook-certgen/rootfs
+
+      - name: Show built images
+        run: docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}' | grep -E "ingress-nginx/ci|^REPOSITORY" || docker images | head -30

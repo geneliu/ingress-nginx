@@ -64,3 +64,6 @@ tests/__snapshot__
 
 # Local patch build output (helm tgz)
 dist/patch-artifacts/
+
+# Corporate TLS PEMs for nginx local image build (images/nginx/rootfs/build-certs)
+images/nginx/rootfs/build-certs/*.pem
